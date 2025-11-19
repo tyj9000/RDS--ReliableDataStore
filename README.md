@@ -77,6 +77,23 @@ local jsonData = PlayerDataStore:Export(player)
 PlayerDataStore:Import(player, jsonData)
 ```
 
+### Working with nested values
+
+RDS supports **nested tables** using dot-separated keys. For example, modifying a player's inventory:
+
+```lua
+-- Add an item to the inventory
+local inventory = PlayerDataStore:Get(player, "Inventory") or {}
+inventory["Sword"] = (inventory["Sword"] or 0) + 1
+PlayerDataStore:Set(player, "Inventory.Sword", inventory["Sword"])
+
+-- Remove an item
+inventory["Potion"] = (inventory["Potion"] or 0) - 1
+PlayerDataStore:Set(player, "Inventory.Potion", inventory["Potion"])
+```
+
+This ensures delta-save detects changes and saves only the modified fields.
+
 ### Increment helper (optional)
 
 You can implement your own helper to increment safely:
@@ -147,10 +164,8 @@ local options = {
 * Automatic locks prevent multiple sessions from overwriting each other's data.
 * Stale session detection ensures that inactive players don’t lock data indefinitely.
 * Delta-save and dirty-field tracking optimize performance and reduce DataStore writes.
-* All original APIs (`Get`, `Set`, `Export`, `Import`) remain fully functional.
-
 ---
 
 ## License
 
-MIT License. tyj9000 2025
+MIT License

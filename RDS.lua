@@ -1,7 +1,4 @@
--- ReliableDataStore v2.0.0
--- Backwards-compatible extension of the ReliableDataStore module
--- Adds: delta-save, pluggable compression, schema validation, session timeout recovery,
--- migration versioning API, and a few quality-of-life helpers.
+
 
 local DataStoreService = game:GetService("DataStoreService")
 local MemoryStoreService = game:GetService("MemoryStoreService")

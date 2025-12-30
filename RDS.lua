@@ -9,13 +9,18 @@ local ReliableDataStore = {}
 ReliableDataStore.__index = ReliableDataStore
 
 ---------------------------------------------------------------------
--- Constants
+-- Constants (ProfileStore-inspired)
 ---------------------------------------------------------------------
+local AUTO_SAVE_PERIOD = 300 -- 5 minutes (ProfileStore uses this)
+local FIRST_LOAD_REPEAT = 5
+local LOAD_REPEAT_PERIOD = 10
+local SESSION_STEAL_TIMEOUT = 40
+local ASSUME_DEAD_SESSION = 630 -- 10.5 minutes
+local START_SESSION_TIMEOUT = 120
+
 local MAX_RETRIES = 5
 local BASE_RETRY_DELAY = 0.5
 local MAX_RETRY_DELAY = 10
-local DATASTORE_BUDGET_REFRESH = 60
-local VERSION_HISTORY_LIMIT = 5
 
 ---------------------------------------------------------------------
 -- Utilities
@@ -87,9 +92,8 @@ local function retryWithBackoff(fn, maxRetries, context)
 		end
 		
 		if attempt < maxRetries then
-			-- Exponential backoff with jitter
 			local delay = math.min(BASE_RETRY_DELAY * (2 ^ (attempt - 1)), MAX_RETRY_DELAY)
-			delay = delay * (0.5 + math.random() * 0.5) -- Add jitter
+			delay = delay * (0.5 + math.random() * 0.5)
 			task.wait(delay)
 		end
 	end
@@ -97,40 +101,209 @@ local function retryWithBackoff(fn, maxRetries, context)
 	return false, lastErr
 end
 
--- Budget tracking for DataStore operations
-local DataStoreBudget = {}
-DataStoreBudget.__index = DataStoreBudget
+---------------------------------------------------------------------
+-- Signal Implementation (for events)
+---------------------------------------------------------------------
+local Signal = {}
+Signal.__index = Signal
 
-function DataStoreBudget.new()
+function Signal.new()
 	local self = setmetatable({
-		reads = 0,
-		writes = 0,
-		lastReset = os.clock(),
-	}, DataStoreBudget)
+		_connections = {}
+	}, Signal)
 	return self
 end
 
-function DataStoreBudget:canOperate(opType)
-	-- Simple throttling: reset counters every minute
-	if os.clock() - self.lastReset > DATASTORE_BUDGET_REFRESH then
-		self.reads = 0
-		self.writes = 0
-		self.lastReset = os.clock()
+function Signal:Connect(fn)
+	local connection = {
+		Connected = true,
+		_fn = fn,
+		_signal = self
+	}
+	
+	function connection:Disconnect()
+		self.Connected = false
+		local index = table.find(self._signal._connections, self)
+		if index then
+			table.remove(self._signal._connections, index)
+		end
 	end
 	
-	-- Conservative limits
-	if opType == "read" and self.reads >= 60 then return false end
-	if opType == "write" and self.writes >= 60 then return false end
-	
-	return true
+	table.insert(self._connections, connection)
+	return connection
 end
 
-function DataStoreBudget:recordOp(opType)
-	if opType == "read" then
-		self.reads = self.reads + 1
-	elseif opType == "write" then
-		self.writes = self.writes + 1
+function Signal:Fire(...)
+	for _, conn in ipairs(self._connections) do
+		if conn.Connected then
+			task.spawn(conn._fn, ...)
+		end
 	end
+end
+
+---------------------------------------------------------------------
+-- GlobalUpdates System (ProfileService feature)
+---------------------------------------------------------------------
+local GlobalUpdates = {}
+GlobalUpdates.__index = GlobalUpdates
+
+function GlobalUpdates.new(profile)
+	local self = setmetatable({
+		_profile = profile,
+		_active_updates = {},
+		_locked_updates = {},
+		_update_index = 0,
+		OnNewActiveUpdate = Signal.new(),
+		OnNewLockedUpdate = Signal.new(),
+	}, GlobalUpdates)
+	return self
+end
+
+function GlobalUpdates:GetActiveUpdates()
+	return deepCopy(self._active_updates)
+end
+
+function GlobalUpdates:GetLockedUpdates()
+	return deepCopy(self._locked_updates)
+end
+
+function GlobalUpdates:ListenToNewActiveUpdate(listener)
+	return self.OnNewActiveUpdate:Connect(listener)
+end
+
+function GlobalUpdates:ListenToNewLockedUpdate(listener)
+	return self.OnNewLockedUpdate:Connect(listener)
+end
+
+function GlobalUpdates:LockActiveUpdate(update_id)
+	if not self._profile:IsActive() then
+		error("[RDS] Cannot lock update on inactive profile")
+	end
+	
+	for i, update in ipairs(self._active_updates) do
+		if update.id == update_id then
+			table.remove(self._active_updates, i)
+			table.insert(self._locked_updates, update)
+			self.OnNewLockedUpdate:Fire(update.id, update.data)
+			return
+		end
+	end
+end
+
+function GlobalUpdates:ClearLockedUpdate(update_id)
+	if not self._profile:IsActive() then
+		error("[RDS] Cannot clear update on inactive profile")
+	end
+	
+	for i, update in ipairs(self._locked_updates) do
+		if update.id == update_id then
+			table.remove(self._locked_updates, i)
+			return
+		end
+	end
+end
+
+function GlobalUpdates:AddActiveUpdate(update_data)
+	self._update_index = self._update_index + 1
+	local update = {
+		id = self._update_index,
+		data = update_data,
+		timestamp = os.time()
+	}
+	table.insert(self._active_updates, update)
+	return update.id
+end
+
+function GlobalUpdates:_serialize()
+	return {
+		update_index = self._update_index,
+		active = self._active_updates,
+		locked = self._locked_updates,
+	}
+end
+
+function GlobalUpdates:_deserialize(data)
+	if not data then return end
+	self._update_index = data.update_index or 0
+	self._active_updates = data.active or {}
+	self._locked_updates = data.locked or {}
+end
+
+---------------------------------------------------------------------
+-- Profile Object (ProfileService-style)
+---------------------------------------------------------------------
+local Profile = {}
+Profile.__index = Profile
+
+function Profile.new(store, key, data)
+	local self = setmetatable({
+		Data = data,
+		Key = key,
+		Store = store,
+		MetaData = {
+			MetaTags = {},
+			LastUpdate = os.time(),
+			LoadCount = 0,
+		},
+		GlobalUpdates = GlobalUpdates.new(),
+		LastSavedData = nil,
+		
+		-- Internal
+		_session_id = HttpService:GenerateGUID(false),
+		_active = false,
+		_load_count = 0,
+		_last_save_time = 0,
+		_msg_subscription = nil,
+		
+		-- Events
+		OnSave = Signal.new(),
+		OnLastSave = Signal.new(),
+	}, Profile)
+	
+	-- Deserialize GlobalUpdates if they exist
+	if data._GlobalUpdates then
+		self.GlobalUpdates:_deserialize(data._GlobalUpdates)
+		data._GlobalUpdates = nil
+	end
+	
+	return self
+end
+
+function Profile:IsActive()
+	return self._active
+end
+
+function Profile:GetMetaTag(tag_name)
+	return self.MetaData.MetaTags[tag_name]
+end
+
+function Profile:SetMetaTag(tag_name, value)
+	if not self:IsActive() then
+		error("[RDS] Cannot set MetaTag on inactive profile")
+	end
+	self.MetaData.MetaTags[tag_name] = value
+end
+
+function Profile:Reconcile()
+	if not self:IsActive() then
+		error("[RDS] Cannot reconcile inactive profile")
+	end
+	deepMerge(self.Data, deepCopy(self.Store.defaults))
+end
+
+function Profile:Save()
+	if not self:IsActive() then
+		warn("[RDS] Attempted to save inactive profile")
+		return
+	end
+	self.Store:_saveProfile(self, false)
+end
+
+function Profile:Release()
+	if not self:IsActive() then
+		return
+	end
+	self.Store:_saveProfile(self, true)
 end
 
 ---------------------------------------------------------------------
@@ -144,20 +317,18 @@ function ReliableDataStore.new(name, defaults, options)
 		store = DataStoreService:GetDataStore(name),
 		locks = MemoryStoreService:GetSortedMap("RDS_LOCK_" .. name),
 		defaults = deepCopy(defaults or {}),
-		sessions = {},
+		profiles = {},
 		jobId = game.JobId ~= "" and game.JobId or HttpService:GenerateGUID(false),
-		budget = DataStoreBudget.new(),
 		shuttingDown = false,
 
-		-- Settings with better defaults
+		-- Settings (ProfileStore-inspired)
 		settings = {
+			autoSave = options.autoSave or AUTO_SAVE_PERIOD,
 			lockTTL = options.lockTTL or 120,
-			autosave = options.autosave or 60, -- Increased from 30
 			retries = options.retries or MAX_RETRIES,
-			backupCount = options.backupCount or 3,
-			sessionTimeout = options.sessionTimeout or 600,
-			enableBudgetTracking = options.enableBudgetTracking ~= false,
-			gracefulShutdownTimeout = options.gracefulShutdownTimeout or 30,
+			useMessagingService = options.useMessagingService ~= false,
+			sessionStealTimeout = options.sessionStealTimeout or SESSION_STEAL_TIMEOUT,
+			assumeDeadSession = options.assumeDeadSession or ASSUME_DEAD_SESSION,
 		},
 
 		validators = {},
@@ -169,32 +340,62 @@ function ReliableDataStore.new(name, defaults, options)
 			decode = function(x) return x end 
 		},
 
-		events = {
-			OnLoaded = Instance.new("BindableEvent"),
-			OnSaved = Instance.new("BindableEvent"),
-			OnKicked = Instance.new("BindableEvent"),
-			OnConflict = Instance.new("BindableEvent"),
-			OnError = Instance.new("BindableEvent"),
-		},
+		-- Events
+		OnProfileLoaded = Signal.new(),
+		OnProfileSaved = Signal.new(),
+		OnProfileReleased = Signal.new(),
+		OnError = Signal.new(),
+		OnCriticalState = Signal.new(),
+		
+		-- Issue tracking
+		_issue_queue = {},
+		_critical_state = false,
 	}, ReliableDataStore)
 
 	return inst
 end
 
 function ReliableDataStore:On(event)
-	return self.events[event].Event
+	return self[event]
 end
 
-function ReliableDataStore:Log(level, msg, plr)
+function ReliableDataStore:Log(level, msg, profile)
 	local timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-	local playerInfo = plr and (" [%s:%d]"):format(plr.Name, plr.UserId) or ""
-	local message = ("[%s] [ReliableDataStore:%s]%s %s"):format(level, self.name, playerInfo, tostring(msg))
+	local profileInfo = profile and (" [%s]"):format(profile.Key) or ""
+	local message = ("[%s] [RDS:%s]%s %s"):format(level, self.name, profileInfo, tostring(msg))
 	
 	if level == "ERROR" then
 		warn(message)
-		self.events.OnError:Fire(msg, plr)
+		self.OnError:Fire(msg, profile)
+		self:_trackIssue()
 	else
 		print(message)
+	end
+end
+
+---------------------------------------------------------------------
+-- Issue Tracking & Critical State (ProfileService feature)
+---------------------------------------------------------------------
+function ReliableDataStore:_trackIssue()
+	local now = os.time()
+	table.insert(self._issue_queue, now)
+	
+	-- Remove old issues (> 2 minutes)
+	while #self._issue_queue > 0 and (now - self._issue_queue[1]) > 120 do
+		table.remove(self._issue_queue, 1)
+	end
+	
+	-- Check for critical state
+	if #self._issue_queue >= 5 and not self._critical_state then
+		self._critical_state = true
+		self.OnCriticalState:Fire()
+		self:Log("CRITICAL", "Entered critical state - experiencing multiple DataStore errors")
+		
+		-- Auto-recover after 2 minutes
+		task.delay(120, function()
+			self._critical_state = false
+			self._issue_queue = {}
+		end)
 	end
 end
 
@@ -278,40 +479,94 @@ local function applyMigrations(self, data)
 end
 
 ---------------------------------------------------------------------
--- Locking with stale recovery
+-- MessagingService Integration (ProfileStore feature)
 ---------------------------------------------------------------------
-function ReliableDataStore:_lock(key, refresh)
+function ReliableDataStore:_setupMessaging(profile)
+	if not self.settings.useMessagingService then return end
+	
+	local topic = "RDS_" .. profile.Key
+	
+	-- Protect against MessagingService blocking
+	local success = pcall(function()
+		profile._msg_subscription = MessagingService:SubscribeAsync(topic, function(message)
+			if type(message.Data) ~= "table" then return end
+			if message.Data.session_id == profile._session_id then return end
+			
+			-- Another server wants this profile
+			if message.Data.action == "request_release" then
+				self:Log("INFO", "Received session release request via MessagingService", profile)
+				profile:Release()
+			end
+		end)
+	end)
+	
+	if not success then
+		self:Log("WARN", "MessagingService subscription failed, falling back to polling", profile)
+	end
+end
+
+function ReliableDataStore:_requestRelease(key)
+	if not self.settings.useMessagingService then return end
+	
+	local topic = "RDS_" .. key
+	pcall(function()
+		MessagingService:PublishAsync(topic, {
+			action = "request_release",
+			session_id = HttpService:GenerateGUID(false),
+			timestamp = os.time()
+		})
+	end)
+end
+
+---------------------------------------------------------------------
+-- Session Locking (Enhanced with MessagingService)
+---------------------------------------------------------------------
+function ReliableDataStore:_acquireLock(key, session_id)
 	local ttl = self.settings.lockTTL
-	local job = self.jobId
 	
 	local ok, res = pcall(function()
 		return self.locks:UpdateAsync(key, function(cur)
 			if not cur then
-				return { owner = job, ts = os.clock(), acquired = os.time() }
+				return {
+					owner = self.jobId,
+					session_id = session_id,
+					ts = os.time(),
+					last_update = os.time()
+				}
 			end
 			
-			if cur.owner == job then
-				return { owner = job, ts = os.clock(), acquired = cur.acquired }
+			-- We already own it
+			if cur.owner == self.jobId and cur.session_id == session_id then
+				return {
+					owner = self.jobId,
+					session_id = session_id,
+					ts = cur.ts,
+					last_update = os.time()
+				}
 			end
 			
-			-- Detect stale lock (no heartbeat for 2x TTL)
-			if type(cur.ts) == "number" and (os.clock() - cur.ts) > (ttl * 2) then
-				self:Log("WARN", ("Stealing stale lock for %s (owner=%s, age=%ds)"):format(
-					key, tostring(cur.owner), os.clock() - cur.ts
-				))
-				return { owner = job, ts = os.clock(), acquired = os.time() }
+			-- Check if lock is stale
+			local age = os.time() - (cur.last_update or cur.ts or 0)
+			if age > self.settings.assumeDeadSession then
+				self:Log("WARN", ("Stealing stale lock (age=%ds)"):format(age))
+				return {
+					owner = self.jobId,
+					session_id = session_id,
+					ts = os.time(),
+					last_update = os.time()
+				}
 			end
 			
-			return nil -- Lock held by another job
+			return nil -- Lock held by another server
 		end, ttl)
 	end)
 	
 	if not ok then
-		self:Log("ERROR", ("Lock operation failed for %s: %s"):format(key, tostring(res)))
+		self:Log("ERROR", ("Lock operation failed: %s"):format(tostring(res)))
 		return false
 	end
 	
-	return res ~= nil and res.owner == job
+	return res ~= nil and res.owner == self.jobId
 end
 
 function ReliableDataStore:_releaseLock(key)
@@ -320,8 +575,12 @@ function ReliableDataStore:_releaseLock(key)
 	end)
 end
 
+function ReliableDataStore:_refreshLock(key, session_id)
+	return self:_acquireLock(key, session_id)
+end
+
 ---------------------------------------------------------------------
--- Decompression helper
+-- Data Compression/Decompression
 ---------------------------------------------------------------------
 local function decompressData(self, raw)
 	if type(raw) ~= "table" then return raw end
@@ -335,7 +594,7 @@ local function decompressData(self, raw)
 		if ok and type(decoded) == "table" then
 			return decoded
 		else
-			self:Log("WARN", "Failed to decompress data, using raw")
+			self:Log("WARN", "Failed to decompress data")
 			return raw
 		end
 	end
@@ -343,304 +602,277 @@ local function decompressData(self, raw)
 	return raw
 end
 
----------------------------------------------------------------------
--- Load (with migrations, decompression, schema validation)
----------------------------------------------------------------------
-function ReliableDataStore:_load(plr)
-	local key = "u:" .. plr.UserId
+local function compressData(self, data)
+	if not self.compressor or not self.compressor.enabled then
+		return data
+	end
 	
-	-- Acquire lock
-	if not self:_lock(key) then
-		plr:Kick("Your data is currently in use. Please try again in a moment.")
-		self.events.OnKicked:Fire(plr)
-		return
-	end
-
-	-- Check budget
-	if self.settings.enableBudgetTracking and not self.budget:canOperate("read") then
-		self:Log("WARN", "DataStore budget exhausted, delaying load", plr)
-		task.wait(5)
-	end
-
-	-- Load from DataStore
-	local raw
-	local success, err = retryWithBackoff(function()
-		raw = self.store:GetAsync(key)
-	end, self.settings.retries, "Load")
-	
-	if self.settings.enableBudgetTracking then
-		self.budget:recordOp("read")
-	end
-
-	if not success then
-		self:Log("ERROR", ("Failed to load data: %s"):format(tostring(err)), plr)
-		plr:Kick("Failed to load your data. Please try again.")
-		self:_releaseLock(key)
-		return
-	end
-
-	-- Initialize or decompress data
-	local data
-	if not raw then
-		data = deepCopy(self.defaults)
-		data._version = 1
-		data._schemaVersion = 0
-		data._metaCreatedAt = os.time()
-	else
-		data = decompressData(self, raw)
-		
-		if type(data) ~= "table" then 
-			self:Log("WARN", "Invalid data format, using defaults", plr)
-			data = deepCopy(self.defaults) 
-		end
-		
-		deepMerge(data, deepCopy(self.defaults))
-		data._version = (data._version or 0) + 1
-	end
-
-	-- Apply migrations
-	local ok, migrated = pcall(function() 
-		return applyMigrations(self, data) 
+	local ok, payload = pcall(function()
+		local json = HttpService:JSONEncode(data)
+		return self.compressor.encode(json)
 	end)
-	if ok and type(migrated) == "table" then 
-		data = migrated 
-	end
-
-	-- Validate schema
-	local valid, validErr = self:ValidateSchema(data)
-	if not valid then
-		self:Log("WARN", ("Schema validation failed: %s"):format(tostring(validErr)), plr)
-	end
-
-	-- Create session
-	self.sessions[plr] = {
-		data = data,
-		version = data._version,
-		dirty = {},
-		backups = {},
-		meta = {
-			CreatedAt = data._metaCreatedAt or os.time(),
-			LastLoaded = os.time(),
-			LastSave = 0,
-			LastHeartbeat = os.clock(),
-			LoadAttempts = (data._metaLoadAttempts or 0) + 1,
-		},
-	}
-
-	self:Log("INFO", ("Loaded data (version=%d, attempts=%d)"):format(
-		data._version, self.sessions[plr].meta.LoadAttempts
-	), plr)
 	
-	self.events.OnLoaded:Fire(plr, deepCopy(data))
+	if ok then
+		return { __compressed = true, payload = payload }
+	end
+	
+	return data
 end
 
 ---------------------------------------------------------------------
--- Public API: Get / Set / Increment / Export / Import
+-- Load Profile (ProfileStore-style with conflict resolution)
+---------------------------------------------------------------------
+function ReliableDataStore:LoadProfileAsync(key, notReleasedHandler)
+	local fullKey = "u:" .. key
+	local session_id = HttpService:GenerateGUID(false)
+	local load_attempts = 0
+	local start_time = os.clock()
+	
+	notReleasedHandler = notReleasedHandler or "ForceLoad"
+	
+	while true do
+		load_attempts = load_attempts + 1
+		
+		-- Check for shutdown
+		if self.shuttingDown then
+			self:Log("INFO", "Load cancelled - server shutting down")
+			return nil
+		end
+		
+		-- Timeout check
+		if os.clock() - start_time > START_SESSION_TIMEOUT then
+			self:Log("ERROR", "Load timeout after " .. START_SESSION_TIMEOUT .. "s")
+			return nil
+		end
+		
+		-- Try to acquire lock
+		if self:_acquireLock(fullKey, session_id) then
+			-- Load data
+			local raw
+			local success, err = retryWithBackoff(function()
+				raw = self.store:GetAsync(fullKey)
+			end, self.settings.retries)
+			
+			if not success then
+				self:Log("ERROR", "Failed to load: " .. tostring(err))
+				self:_releaseLock(fullKey)
+				return nil
+			end
+			
+			-- Initialize or decompress data
+			local data
+			if not raw then
+				data = deepCopy(self.defaults)
+				data._version = 1
+				data._schemaVersion = 0
+			else
+				data = decompressData(self, raw)
+				
+				if type(data) ~= "table" then 
+					data = deepCopy(self.defaults) 
+				end
+				
+				deepMerge(data, deepCopy(self.defaults))
+				data._version = (data._version or 0) + 1
+			end
+			
+			-- Apply migrations
+			local ok, migrated = pcall(function() 
+				return applyMigrations(self, data) 
+			end)
+			if ok and type(migrated) == "table" then 
+				data = migrated 
+			end
+			
+			-- Validate schema
+			local valid, validErr = self:ValidateSchema(data)
+			if not valid then
+				self:Log("WARN", "Schema validation failed: " .. tostring(validErr))
+			end
+			
+			-- Create profile
+			local profile = Profile.new(self, key, data)
+			profile._session_id = session_id
+			profile._active = true
+			profile._load_count = load_attempts
+			profile.LastSavedData = deepCopy(data)
+			profile.MetaData.LoadCount = load_attempts
+			
+			self.profiles[key] = profile
+			
+			-- Setup MessagingService
+			self:_setupMessaging(profile)
+			
+			self:Log("INFO", ("Loaded profile in %d attempts"):format(load_attempts))
+			self.OnProfileLoaded:Fire(profile)
+			
+			return profile
+		else
+			-- Lock is held by another server
+			if load_attempts == 1 then
+				-- First attempt - send release request via MessagingService
+				self:_requestRelease(fullKey)
+				task.wait(FIRST_LOAD_REPEAT)
+			elseif load_attempts * LOAD_REPEAT_PERIOD >= self.settings.sessionStealTimeout then
+				-- Timeout - handle based on notReleasedHandler
+				if type(notReleasedHandler) == "function" then
+					local result = notReleasedHandler(nil, nil)
+					if result == "Cancel" then
+						return nil
+					elseif result == "Steal" or result == "ForceLoad" then
+						-- Force acquire by clearing lock
+						self:_releaseLock(fullKey)
+						task.wait(1)
+						-- Loop will retry
+					end
+				elseif notReleasedHandler == "ForceLoad" or notReleasedHandler == "Steal" then
+					self:_releaseLock(fullKey)
+					task.wait(1)
+				else
+					return nil
+				end
+			else
+				-- Keep waiting
+				self:_requestRelease(fullKey)
+				task.wait(LOAD_REPEAT_PERIOD)
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- GlobalUpdate API (send updates to offline profiles)
+---------------------------------------------------------------------
+function ReliableDataStore:GlobalUpdateProfileAsync(key, updateHandler)
+	local fullKey = "u:" .. key
+	
+	local success, result = retryWithBackoff(function()
+		return self.store:UpdateAsync(fullKey, function(data)
+			data = data or {}
+			data = decompressData(self, data)
+			
+			if type(data) ~= "table" then
+				data = {}
+			end
+			
+			-- Create temporary GlobalUpdates
+			local globalUpdates = GlobalUpdates.new()
+			globalUpdates:_deserialize(data._GlobalUpdates)
+			
+			-- Let handler add updates
+			updateHandler(globalUpdates)
+			
+			-- Serialize back
+			data._GlobalUpdates = globalUpdates:_serialize()
+			
+			return compressData(self, data)
+		end)
+	end, self.settings.retries)
+	
+	if not success then
+		self:Log("ERROR", "GlobalUpdate failed: " .. tostring(result))
+		return nil
+	end
+	
+	return true
+end
+
+---------------------------------------------------------------------
+-- Save Profile
+---------------------------------------------------------------------
+function ReliableDataStore:_saveProfile(profile, release)
+	if not profile:IsActive() then
+		return
+	end
+	
+	local fullKey = "u:" .. profile.Key
+	
+	-- Fire OnSave signal (allows modifications before save)
+	profile.OnSave:Fire()
+	
+	-- Serialize GlobalUpdates into data
+	profile.Data._GlobalUpdates = profile.GlobalUpdates:_serialize()
+	profile.Data._version = (profile.Data._version or 0) + 1
+	profile.MetaData.LastUpdate = os.time()
+	
+	local saveData = deepCopy(profile.Data)
+	saveData._MetaData = profile.MetaData
+	
+	local success, err = retryWithBackoff(function()
+		return self.store:UpdateAsync(fullKey, function(old)
+			return compressData(self, saveData)
+		end)
+	end, self.settings.retries)
+	
+	if not success then
+		self:Log("ERROR", "Save failed: " .. tostring(err), profile)
+		return
+	end
+	
+	profile.LastSavedData = deepCopy(profile.Data)
+	profile._last_save_time = os.time()
+	
+	self:Log("INFO", "Saved successfully", profile)
+	self.OnProfileSaved:Fire(profile)
+	
+	if release then
+		-- Fire OnLastSave signal
+		profile.OnLastSave:Fire()
+		
+		-- Cleanup
+		profile._active = false
+		if profile._msg_subscription then
+			pcall(function() profile._msg_subscription:Disconnect() end)
+		end
+		self:_releaseLock(fullKey)
+		self.profiles[profile.Key] = nil
+		
+		self.OnProfileReleased:Fire(profile)
+		self:Log("INFO", "Released profile", profile)
+	end
+end
+
+---------------------------------------------------------------------
+-- Public API: Backwards Compatible Wrappers
 ---------------------------------------------------------------------
 function ReliableDataStore:Get(plr, key)
-	local session = self.sessions[plr]
-	if not session then return nil end
-	session.meta.LastHeartbeat = os.clock()
-	return key and deepGet(session.data, key) or session.data
+	local profile = self.profiles[tostring(plr.UserId)]
+	if not profile then return nil end
+	return key and deepGet(profile.Data, key) or profile.Data
 end
 
 function ReliableDataStore:Set(plr, key, value)
-	local session = self.sessions[plr]
-	if not session then 
-		self:Log("WARN", "Attempted to set data for player without session", plr)
-		return false 
-	end
-
+	local profile = self.profiles[tostring(plr.UserId)]
+	if not profile then return false end
+	
 	-- Validate
 	if key and self.validators[key] then
 		local ok, err = pcall(self.validators[key], value)
 		if not ok or not err then
-			self:Log("WARN", ("Validation failed for %s: %s"):format(key, tostring(err or "returned false")), plr)
+			self:Log("WARN", ("Validation failed for %s"):format(key), profile)
 			return false
 		end
 	end
-
+	
 	if not key then
-		session.data = value
-		session.dirty["_root"] = true
+		profile.Data = value
 	else
-		deepSet(session.data, key, value)
-		session.dirty[key] = true
+		deepSet(profile.Data, key, value)
 	end
-
-	session.version = session.version + 1
-	session.meta.LastHeartbeat = os.clock()
+	
 	return true
 end
 
--- Safe numeric increment
 function ReliableDataStore:Increment(plr, key, amount)
-	amount = amount or 1
 	local current = self:Get(plr, key)
-	
-	if type(current) ~= "number" then
-		self:Log("WARN", ("Cannot increment non-number at %s"):format(key), plr)
-		return false
-	end
-	
-	return self:Set(plr, key, current + amount)
-end
-
-function ReliableDataStore:Export(plr)
-	local session = self.sessions[plr]
-	if not session then return nil end
-	return HttpService:JSONEncode(session.data)
-end
-
-function ReliableDataStore:Import(plr, json)
-	local ok, decoded = pcall(HttpService.JSONDecode, HttpService, json)
-	if not ok then 
-		self:Log("ERROR", "Failed to decode import data", plr)
-		return false 
-	end
-	
-	local session = self.sessions[plr]
-	if not session then return false end
-	
-	-- Validate imported data
-	local valid, err = self:ValidateSchema(decoded)
-	if not valid then
-		self:Log("ERROR", ("Imported data failed validation: %s"):format(tostring(err)), plr)
-		return false
-	end
-	
-	session.data = decoded
-	session.version = session.version + 1
-	session.dirty["_root"] = true
-	return true
-end
-
----------------------------------------------------------------------
--- Delta-save helper
----------------------------------------------------------------------
-local function applyDeltasToOld(old, newData, dirtyPaths)
-	if dirtyPaths["_root"] then
-		return deepCopy(newData)
-	end
-	
-	old = type(old) == "table" and old or {}
-	local patched = deepCopy(old)
-	
-	for path in pairs(dirtyPaths) do
-		if path ~= "_root" then
-			local val = deepGet(newData, path)
-			deepSet(patched, path, deepCopy(val))
-		end
-	end
-	
-	return patched
-end
-
----------------------------------------------------------------------
--- Save (delta-save + compression + backups + conflict handling)
----------------------------------------------------------------------
-function ReliableDataStore:_save(plr, release)
-	local session = self.sessions[plr]
-	if not session then return end
-
-	local key = "u:" .. plr.UserId
-	local saveSnapshot = deepCopy(session.data)
-	saveSnapshot._version = session.version
-	saveSnapshot._metaLoadAttempts = session.meta.LoadAttempts
-	saveSnapshot._metaLastSaved = os.time()
-
-	local dirty = session.dirty or {}
-	local hasDirty = next(dirty) ~= nil
-
-	-- Check budget
-	if self.settings.enableBudgetTracking and not self.budget:canOperate("write") then
-		self:Log("WARN", "DataStore budget exhausted, delaying save", plr)
-		task.wait(5)
-	end
-
-	local success, err = retryWithBackoff(function()
-		return self.store:UpdateAsync(key, function(old)
-			old = type(old) == "table" and old or {}
-			old = decompressData(self, old)
-
-			-- Conflict detection
-			if (old._version or 0) > saveSnapshot._version then
-				self:Log("WARN", ("Conflict: store version %d > local %d"):format(
-					old._version, saveSnapshot._version
-				), plr)
-				self.events.OnConflict:Fire(plr, old, saveSnapshot)
-				return old
-			end
-
-			local toWrite
-			if not hasDirty then
-				toWrite = old
-			else
-				toWrite = applyDeltasToOld(old, saveSnapshot, dirty)
-				toWrite._version = saveSnapshot._version
-				toWrite._metaLastSaved = saveSnapshot._metaLastSaved
-				toWrite._metaLoadAttempts = saveSnapshot._metaLoadAttempts
-			end
-
-			-- Compress if enabled
-			if self.compressor and self.compressor.enabled then
-				local json = HttpService:JSONEncode(toWrite)
-				local okc, payload = pcall(self.compressor.encode, json)
-				if okc then
-					return { __compressed = true, payload = payload }
-				end
-			end
-
-			return toWrite
-		end)
-	end, self.settings.retries, "Save")
-	
-	if self.settings.enableBudgetTracking then
-		self.budget:recordOp("write")
-	end
-
-	if not success then
-		self:Log("ERROR", ("Failed to save: %s"):format(tostring(err)), plr)
-	else
-		-- Rotate backups
-		if hasDirty then
-			table.insert(session.backups, 1, deepCopy(saveSnapshot))
-			while #session.backups > self.settings.backupCount do
-				table.remove(session.backups)
-			end
-		end
-		
-		session.dirty = {}
-		session.meta.LastSave = os.time()
-		self:Log("INFO", "Saved successfully", plr)
-		self.events.OnSaved:Fire(plr, saveSnapshot)
-	end
-
-	if release then
-		self:_releaseLock(key)
-		self.sessions[plr] = nil
-	end
+	if type(current) ~= "number" then return false end
+	return self:Set(plr, key, current + (amount or 1))
 end
 
 function ReliableDataStore:ForceSave(plr)
-	self:_save(plr, false)
-end
-
-function ReliableDataStore:_saveAll()
-	local players = {}
-	for plr in pairs(self.sessions) do
-		table.insert(players, plr)
-	end
-	
-	self:Log("INFO", ("Saving all sessions (%d players)"):format(#players))
-	
-	for _, plr in ipairs(players) do
-		local ok, err = pcall(function()
-			self:_save(plr, true)
-		end)
-		if not ok then
-			self:Log("ERROR", ("Failed to save during shutdown: %s"):format(tostring(err)), plr)
-		end
+	local profile = self.profiles[tostring(plr.UserId)]
+	if profile then
+		profile:Save()
 	end
 end
 
@@ -649,91 +881,87 @@ end
 ---------------------------------------------------------------------
 function ReliableDataStore:Start()
 	if self._started then
-		warn("[ReliableDataStore] Already started")
+		warn("[RDS] Already started")
 		return
 	end
 	self._started = true
 
 	-- Player lifecycle
-	Players.PlayerAdded:Connect(function(plr) 
-		pcall(function() self:_load(plr) end)
+	Players.PlayerAdded:Connect(function(plr)
+		local profile = self:LoadProfileAsync(tostring(plr.UserId))
+		if not profile then
+			plr:Kick("Failed to load your data. Please rejoin.")
+		end
 	end)
 	
-	Players.PlayerRemoving:Connect(function(plr) 
-		pcall(function() self:_save(plr, true) end)
+	Players.PlayerRemoving:Connect(function(plr)
+		local profile = self.profiles[tostring(plr.UserId)]
+		if profile then
+			profile:Release()
+		end
 	end)
 	
 	-- Graceful shutdown
-	game:BindToClose(function() 
+	game:BindToClose(function()
 		self.shuttingDown = true
-		self:_saveAll()
+		self:Log("INFO", "Server shutting down, saving all profiles...")
 		
-		-- Wait for saves to complete
-		local timeout = self.settings.gracefulShutdownTimeout
+		local profiles = {}
+		for _, profile in pairs(self.profiles) do
+			table.insert(profiles, profile)
+		end
+		
+		for _, profile in ipairs(profiles) do
+			pcall(function()
+				profile:Release()
+			end)
+		end
+		
+		-- Wait for saves
+		local timeout = 30
 		local elapsed = 0
-		while next(self.sessions) and elapsed < timeout do
+		while next(self.profiles) and elapsed < timeout do
 			task.wait(0.1)
 			elapsed = elapsed + 0.1
 		end
 	end)
 
-	-- Autosave loop
+	-- Auto-save loop (ProfileStore uses 300s)
 	task.spawn(function()
-		while task.wait(self.settings.autosave) do
+		local profileList = {}
+		while task.wait(self.settings.autoSave / 100) do -- Spread saves
 			if self.shuttingDown then break end
 			
-			for plr in pairs(self.sessions) do
-				pcall(function() 
-					self:_save(plr, false) 
+			-- Build profile list
+			profileList = {}
+			for _, profile in pairs(self.profiles) do
+				table.insert(profileList, profile)
+			end
+			
+			-- Save one profile per iteration to spread load
+			if #profileList > 0 then
+				local profile = profileList[(os.clock() % #profileList) + 1]
+				pcall(function()
+					self:_saveProfile(profile, false)
 				end)
 			end
 		end
 	end)
 
-	-- Lock renewal & session monitoring
+	-- Lock refresh loop
 	task.spawn(function()
 		while task.wait(self.settings.lockTTL / 3) do
 			if self.shuttingDown then break end
 			
-			for plr, s in pairs(self.sessions) do
+			for _, profile in pairs(self.profiles) do
 				pcall(function()
-					local key = "u:" .. plr.UserId
-					self:_lock(key, true)
-					
-					-- Check for session timeout
-					local inactive = os.clock() - (s.meta.LastHeartbeat or 0)
-					if inactive > self.settings.sessionTimeout then
-						self:Log("WARN", ("Session timeout after %ds of inactivity"):format(inactive), plr)
-						self:_save(plr, true)
-					end
+					self:_refreshLock("u:" .. profile.Key, profile._session_id)
 				end)
 			end
 		end
 	end)
 
 	self:Log("INFO", "Started successfully")
-end
-
----------------------------------------------------------------------
--- Utility methods
----------------------------------------------------------------------
-function ReliableDataStore:GetBackup(plr, index)
-	local session = self.sessions[plr]
-	if not session then return nil end
-	return session.backups[index or 1]
-end
-
-function ReliableDataStore:RestoreBackup(plr, index)
-	local backup = self:GetBackup(plr, index)
-	if not backup then return false end
-	
-	local session = self.sessions[plr]
-	session.data = deepCopy(backup)
-	session.version = session.version + 1
-	session.dirty["_root"] = true
-	
-	self:Log("INFO", ("Restored backup %d"):format(index or 1), plr)
-	return true
 end
 
 return ReliableDataStore
